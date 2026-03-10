@@ -2,57 +2,113 @@
 
 import { useRef, useState } from "react";
 
-type ComponentStats = {
-  pixels: number[];
-  count: number;
-  minX: number;
-  maxX: number;
-  minY: number;
-  maxY: number;
-  centerDistAvg: number;
-};
+type ToolMode = "move" | "bruise" | "erase";
 
 export default function Home() {
   const frameSize = 560;
 
   const [image, setImage] = useState<string | null>(null);
+  const [imgNaturalSize, setImgNaturalSize] = useState({ width: 0, height: 0 });
   const [imgOffset, setImgOffset] = useState({ x: 0, y: 0 });
   const [zoom, setZoom] = useState(1);
+
+  const [toolMode, setToolMode] = useState<ToolMode>("move");
+  const [bruiseBrushSize, setBruiseBrushSize] = useState(28);
+  const [eraseBrushSize, setEraseBrushSize] = useState(24);
+
   const [draggingImage, setDraggingImage] = useState(false);
+  const [painting, setPainting] = useState(false);
 
   const [analysisText, setAnalysisText] = useState(
-    "Center the bruise, then click Detect Bruise."
+    "Upload a photo, adjust it if needed, mark the bruise area, then click Analyze."
   );
-  const [detected, setDetected] = useState(false);
+
+  const [result, setResult] = useState<{
+    roiPixels: number;
+    corePixels: number;
+    coreRatio: number;
+    avgR: number;
+    avgG: number;
+    avgB: number;
+    severity: string;
+    areaLevel: string;
+    darknessLevel: string;
+    summary: string;
+  } | null>(null);
 
   const dragStartRef = useRef({ x: 0, y: 0 });
-  const startOffsetRef = useRef({ x: 0, y: 0 });
+  const offsetStartRef = useRef({ x: 0, y: 0 });
 
   const imgRef = useRef<HTMLImageElement | null>(null);
   const roiCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const maskCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  function startDrag(clientX: number, clientY: number) {
-    if (!image) return;
-    setDraggingImage(true);
-    dragStartRef.current = { x: clientX, y: clientY };
-    startOffsetRef.current = { ...imgOffset };
+  function getDisplayedSize(currentZoom: number, natural = imgNaturalSize) {
+    if (!natural.width || !natural.height) {
+      return { width: frameSize * currentZoom, height: frameSize * currentZoom };
+    }
+
+    const scaleToCover = Math.max(
+      frameSize / natural.width,
+      frameSize / natural.height
+    );
+
+    return {
+      width: natural.width * scaleToCover * currentZoom,
+      height: natural.height * scaleToCover * currentZoom,
+    };
   }
 
-  function moveDrag(clientX: number, clientY: number) {
-    if (!draggingImage) return;
+  function clampOffset(
+    nextX: number,
+    nextY: number,
+    currentZoom: number,
+    natural = imgNaturalSize
+  ) {
+    const displayed = getDisplayedSize(currentZoom, natural);
 
-    const dx = clientX - dragStartRef.current.x;
-    const dy = clientY - dragStartRef.current.y;
+    const minX = Math.min(0, frameSize - displayed.width);
+    const maxX = 0;
+    const minY = Math.min(0, frameSize - displayed.height);
+    const maxY = 0;
 
-    setImgOffset({
-      x: startOffsetRef.current.x + dx,
-      y: startOffsetRef.current.y + dy,
-    });
+    return {
+      x: Math.max(minX, Math.min(maxX, nextX)),
+      y: Math.max(minY, Math.min(maxY, nextY)),
+    };
   }
 
-  function endDrag() {
-    setDraggingImage(false);
+  function centerImage(currentZoom: number, natural = imgNaturalSize) {
+    const displayed = getDisplayedSize(currentZoom, natural);
+
+    return clampOffset(
+      (frameSize - displayed.width) / 2,
+      (frameSize - displayed.height) / 2,
+      currentZoom,
+      natural
+    );
+  }
+
+  function getZoomOffsetKeepingFrameCenter(
+    prevZoom: number,
+    nextZoom: number,
+    currentOffset: { x: number; y: number },
+    natural = imgNaturalSize
+  ) {
+    const prevSize = getDisplayedSize(prevZoom, natural);
+    const nextSize = getDisplayedSize(nextZoom, natural);
+
+    const frameCenterX = frameSize / 2;
+    const frameCenterY = frameSize / 2;
+
+    const imagePointX = (frameCenterX - currentOffset.x) / prevSize.width;
+    const imagePointY = (frameCenterY - currentOffset.y) / prevSize.height;
+
+    const rawX = frameCenterX - imagePointX * nextSize.width;
+    const rawY = frameCenterY - imagePointY * nextSize.height;
+
+    return clampOffset(rawX, rawY, nextZoom, natural);
   }
 
   function clearOverlay() {
@@ -60,9 +116,75 @@ export default function Home() {
     if (!overlay) return;
     const ctx = overlay.getContext("2d");
     if (!ctx) return;
-    overlay.width = frameSize;
-    overlay.height = frameSize;
     ctx.clearRect(0, 0, frameSize, frameSize);
+  }
+
+  function clearMask() {
+    const mask = maskCanvasRef.current;
+    if (!mask) return;
+    const ctx = mask.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, frameSize, frameSize);
+    clearOverlay();
+  }
+
+  function redrawOverlay() {
+    const mask = maskCanvasRef.current;
+    const overlay = overlayCanvasRef.current;
+    if (!mask || !overlay) return;
+
+    const maskCtx = mask.getContext("2d", { willReadFrequently: true });
+    const overlayCtx = overlay.getContext("2d");
+    if (!maskCtx || !overlayCtx) return;
+
+    const img = maskCtx.getImageData(0, 0, frameSize, frameSize).data;
+    overlayCtx.clearRect(0, 0, frameSize, frameSize);
+
+    for (let y = 0; y < frameSize; y += 2) {
+      for (let x = 0; x < frameSize; x += 2) {
+        const i = (y * frameSize + x) * 4;
+        if (img[i + 3] < 10) continue;
+
+        overlayCtx.fillStyle = "rgba(0, 120, 255, 0.16)";
+        overlayCtx.fillRect(x, y, 2, 2);
+
+        if (x % 6 === 0 && y % 6 === 0) {
+          overlayCtx.fillStyle = "rgba(0, 120, 255, 0.42)";
+          overlayCtx.beginPath();
+          overlayCtx.arc(x + 1, y + 1, 0.7, 0, Math.PI * 2);
+          overlayCtx.fill();
+        }
+      }
+    }
+  }
+
+  function currentBrushSize() {
+    return toolMode === "erase" ? eraseBrushSize : bruiseBrushSize;
+  }
+
+  function drawBrush(x: number, y: number) {
+    const mask = maskCanvasRef.current;
+    if (!mask) return;
+    const ctx = mask.getContext("2d");
+    if (!ctx) return;
+
+    const radius = currentBrushSize() / 2;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+
+    if (toolMode === "bruise") {
+      ctx.fillStyle = "rgba(255,255,255,1)";
+      ctx.fill();
+    } else if (toolMode === "erase") {
+      ctx.globalCompositeOperation = "destination-out";
+      ctx.fill();
+      ctx.globalCompositeOperation = "source-over";
+    }
+
+    ctx.restore();
+    redrawOverlay();
   }
 
   function drawCurrentViewToCanvas() {
@@ -73,320 +195,234 @@ export default function Home() {
     const ctx = roiCanvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) return null;
 
+    const displayed = getDisplayedSize(zoom);
+
     roiCanvas.width = frameSize;
     roiCanvas.height = frameSize;
     ctx.clearRect(0, 0, frameSize, frameSize);
-    ctx.drawImage(img, imgOffset.x, imgOffset.y, frameSize * zoom, frameSize * zoom);
+    ctx.drawImage(img, imgOffset.x, imgOffset.y, displayed.width, displayed.height);
 
     return ctx;
   }
 
-  function getConnectedComponents(
-    candidateMask: Uint8Array,
-    width: number,
-    height: number
-  ) {
-    const visited = new Uint8Array(width * height);
-    const components: ComponentStats[] = [];
-    const cx = width / 2;
-    const cy = height / 2;
+  function getAreaLevel(roiPixels: number) {
+    if (roiPixels < 18000) return "Small";
+    if (roiPixels < 60000) return "Medium";
+    return "Large";
+  }
 
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        const startIdx = y * width + x;
-        if (!candidateMask[startIdx] || visited[startIdx]) continue;
+  function getDarknessLevel(avgR: number, avgG: number, avgB: number) {
+    const lum = 0.299 * avgR + 0.587 * avgG + 0.114 * avgB;
+    if (lum > 95) return "Light";
+    if (lum > 70) return "Medium";
+    return "Deep";
+  }
 
-        const queue: number[] = [startIdx];
-        visited[startIdx] = 1;
+  function getSummary(severity: string, darknessLevel: string, areaLevel: string) {
+    if (severity === "Strong") {
+      return "The bruise appears strongly visible in the selected area.";
+    }
+    if (severity === "Moderate" && darknessLevel === "Deep") {
+      return "The bruise appears clearly visible with a darker core.";
+    }
+    if (severity === "Moderate") {
+      return "The bruise appears moderately visible.";
+    }
+    if (areaLevel === "Large") {
+      return "The bruise appears spread out but not deeply concentrated.";
+    }
+    return "The bruise appears mildly visible in the selected area.";
+  }
 
-        const pixels: number[] = [];
-        let minX = x;
-        let maxX = x;
-        let minY = y;
-        let maxY = y;
-        let distSum = 0;
+  function analyzeBruise() {
+    const roiCtx = drawCurrentViewToCanvas();
+    const maskCanvas = maskCanvasRef.current;
+    if (!roiCtx || !maskCanvas) return;
 
-        while (queue.length) {
-          const idx = queue.shift()!;
-          const px = idx % width;
-          const py = Math.floor(idx / width);
+    const maskCtx = maskCanvas.getContext("2d", { willReadFrequently: true });
+    if (!maskCtx) return;
 
-          pixels.push(idx);
+    const roiData = roiCtx.getImageData(0, 0, frameSize, frameSize).data;
+    const maskData = maskCtx.getImageData(0, 0, frameSize, frameSize).data;
 
-          if (px < minX) minX = px;
-          if (px > maxX) maxX = px;
-          if (py < minY) minY = py;
-          if (py > maxY) maxY = py;
+    let roiPixels = 0;
+    let sumLum = 0;
+    const selectedPixels: Array<{ r: number; g: number; b: number; lum: number }> = [];
 
-          const dx = px - cx;
-          const dy = py - cy;
-          distSum += Math.sqrt(dx * dx + dy * dy);
+    for (let y = 0; y < frameSize; y++) {
+      for (let x = 0; x < frameSize; x++) {
+        const i = (y * frameSize + x) * 4;
+        if (maskData[i + 3] < 10) continue;
 
-          const neighbors = [
-            [px + 1, py],
-            [px - 1, py],
-            [px, py + 1],
-            [px, py - 1],
-            [px + 1, py + 1],
-            [px - 1, py - 1],
-            [px + 1, py - 1],
-            [px - 1, py + 1],
-          ];
+        const r = roiData[i];
+        const g = roiData[i + 1];
+        const b = roiData[i + 2];
+        const lum = 0.299 * r + 0.587 * g + 0.114 * b;
 
-          for (const [nx, ny] of neighbors) {
-            if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-            const nidx = ny * width + nx;
-            if (!candidateMask[nidx] || visited[nidx]) continue;
-            visited[nidx] = 1;
-            queue.push(nidx);
-          }
-        }
-
-        components.push({
-          pixels,
-          count: pixels.length,
-          minX,
-          maxX,
-          minY,
-          maxY,
-          centerDistAvg: distSum / pixels.length,
-        });
+        roiPixels++;
+        sumLum += lum;
+        selectedPixels.push({ r, g, b, lum });
       }
     }
 
-    return components;
-  }
+    if (roiPixels < 20) {
+      setResult(null);
+      setAnalysisText("Brush more of the bruise area before analyzing.");
+      return;
+    }
 
-  function detectBruise() {
-    const ctx = drawCurrentViewToCanvas();
-    if (!ctx) return;
+    const avgLum = sumLum / roiPixels;
 
-    const overlay = overlayCanvasRef.current;
-    if (!overlay) return;
+    const corePixels = selectedPixels.filter((p) => p.lum < avgLum * 0.85);
+    const finalCore =
+      corePixels.length > 10
+        ? corePixels
+        : selectedPixels.filter((p) => p.lum < avgLum * 0.92);
 
-    const octx = overlay.getContext("2d");
-    if (!octx) return;
+    if (finalCore.length === 0) {
+      setResult(null);
+      setAnalysisText(
+        "Could not isolate a darker bruise core. Try brushing a clearer bruise area."
+      );
+      return;
+    }
 
-    overlay.width = frameSize;
-    overlay.height = frameSize;
-    octx.clearRect(0, 0, frameSize, frameSize);
-
-    const imageData = ctx.getImageData(0, 0, frameSize, frameSize);
-    const data = imageData.data;
-
-    const centerX = frameSize / 2;
-    const centerY = frameSize / 2;
-
-    // 1) ROI 바깥 테두리에서 피부 기준값 추정
     let sr = 0;
     let sg = 0;
     let sb = 0;
-    let count = 0;
 
-    const border = Math.floor(frameSize * 0.14);
-
-    for (let y = 0; y < frameSize; y++) {
-      for (let x = 0; x < frameSize; x++) {
-        const inBorder =
-          x < border ||
-          y < border ||
-          x > frameSize - border ||
-          y > frameSize - border;
-
-        if (!inBorder) continue;
-
-        const i = (y * frameSize + x) * 4;
-        const r = data[i];
-        const g = data[i + 1];
-        const b = data[i + 2];
-
-        const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-
-        // 극단적으로 어둡거나 너무 붉은 영역 제외
-        if (lum > 65 && g > 40 && r < 245 && g < 245 && b < 245) {
-          sr += r;
-          sg += g;
-          sb += b;
-          count++;
-        }
-      }
+    for (const p of finalCore) {
+      sr += p.r;
+      sg += p.g;
+      sb += p.b;
     }
 
-    if (count === 0) {
-      setDetected(false);
-      setAnalysisText("Could not estimate nearby skin. Try another photo.");
-      return;
-    }
+    const avgR = Math.round(sr / finalCore.length);
+    const avgG = Math.round(sg / finalCore.length);
+    const avgB = Math.round(sb / finalCore.length);
 
-    const skinR = sr / count;
-    const skinG = sg / count;
-    const skinB = sb / count;
-    const skinLum = 0.299 * skinR + 0.587 * skinG + 0.114 * skinB;
+    const coreRatioRaw = finalCore.length / roiPixels;
+    const coreRatio = Number((coreRatioRaw * 100).toFixed(1));
 
-    // 2) 픽셀별 bruise-like candidate
-    const candidateMask = new Uint8Array(frameSize * frameSize);
+    let severity = "Mild";
+    if (coreRatioRaw > 0.55) severity = "Strong";
+    else if (coreRatioRaw > 0.32) severity = "Moderate";
 
-    for (let y = 0; y < frameSize; y++) {
-      for (let x = 0; x < frameSize; x++) {
-        const i = (y * frameSize + x) * 4;
-        const r = data[i];
-        const g = data[i + 1];
-        const b = data[i + 2];
+    const areaLevel = getAreaLevel(roiPixels);
+    const darknessLevel = getDarknessLevel(avgR, avgG, avgB);
+    const summary = getSummary(severity, darknessLevel, areaLevel);
 
-        const dx = x - centerX;
-        const dy = y - centerY;
-        const dist = Math.sqrt(dx * dx + dy * dy);
+    setResult({
+      roiPixels,
+      corePixels: finalCore.length,
+      coreRatio,
+      avgR,
+      avgG,
+      avgB,
+      severity,
+      areaLevel,
+      darknessLevel,
+      summary,
+    });
 
-        // 중심에서 너무 멀면 아예 제외
-        if (dist > frameSize * 0.34) continue;
-
-        const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-        const diff =
-          Math.abs(r - skinR) + Math.abs(g - skinG) + Math.abs(b - skinB);
-
-        const darker = skinLum - lum;
-        const purpleBias = ((r + b) / 2) - g;
-        const redBlueStrong = Math.max(r - g, 0) + Math.max(b - g, 0);
-
-        const isBruiseLike =
-          diff > 62 &&
-          darker > 8 &&
-          (purpleBias > 6 || redBlueStrong > 18);
-
-        if (isBruiseLike) {
-          candidateMask[y * frameSize + x] = 1;
-        }
-      }
-    }
-
-    const components = getConnectedComponents(candidateMask, frameSize, frameSize);
-
-    if (components.length === 0) {
-      setDetected(false);
-      setAnalysisText(
-        "No clear bruise candidate found. Re-center the bruise and try again."
-      );
-      return;
-    }
-
-    // 3) 가장 그럴듯한 덩어리 선택
-    let best: ComponentStats | null = null;
-    let bestScore = -Infinity;
-
-    for (const comp of components) {
-      if (comp.count < 120) continue;
-
-      const width = comp.maxX - comp.minX + 1;
-      const height = comp.maxY - comp.minY + 1;
-      const boxArea = width * height;
-      const fillRatio = comp.count / boxArea;
-      const aspect = width > height ? width / height : height / width;
-
-      // 너무 가늘고 긴 덩어리는 버림
-      if (aspect > 3.2) continue;
-
-      const compactnessBonus = fillRatio * 140;
-      const sizeBonus = Math.min(comp.count / 18, 120);
-      const centerBonus = Math.max(0, 150 - comp.centerDistAvg);
-
-      const score = compactnessBonus + sizeBonus + centerBonus;
-
-      if (score > bestScore) {
-        bestScore = score;
-        best = comp;
-      }
-    }
-
-    if (!best) {
-      setDetected(false);
-      setAnalysisText(
-        "Detection looks unstable. Try zooming in more and centering the bruise again."
-      );
-      return;
-    }
-
-    // 4) 오버레이 그리기
-    let minX = frameSize;
-    let minY = frameSize;
-    let maxX = 0;
-    let maxY = 0;
-
-    for (const idx of best.pixels) {
-      const x = idx % frameSize;
-      const y = Math.floor(idx / frameSize);
-
-      if (x < minX) minX = x;
-      if (x > maxX) maxX = x;
-      if (y < minY) minY = y;
-      if (y > maxY) maxY = y;
-
-      if (x % 3 === 0 && y % 3 === 0) {
-        octx.fillStyle = "rgba(0, 120, 255, 0.15)";
-        octx.fillRect(x, y, 3, 3);
-
-        octx.fillStyle = "rgba(0, 120, 255, 0.42)";
-        octx.beginPath();
-        octx.arc(x + 1.5, y + 1.5, 0.8, 0, Math.PI * 2);
-        octx.fill();
-      }
-    }
-
-    // bounding hint
-    octx.strokeStyle = "rgba(0,120,255,0.85)";
-    octx.lineWidth = 2;
-    octx.strokeRect(minX, minY, maxX - minX, maxY - minY);
-
-    setDetected(true);
     setAnalysisText(
-      "Possible bruise detected. If it looks right, continue. If not, re-center or zoom and detect again."
+      "Analysis complete. The darker bruise core was measured inside your selected region."
     );
   }
 
-  function resetAll() {
-    setImage(null);
-    setImgOffset({ x: 0, y: 0 });
-    setZoom(1);
-    setDetected(false);
-    setAnalysisText("Center the bruise, then click Detect Bruise.");
-    clearOverlay();
+  function startMove(clientX: number, clientY: number) {
+    if (!image) return;
+    setDraggingImage(true);
+    dragStartRef.current = { x: clientX, y: clientY };
+    offsetStartRef.current = { ...imgOffset };
   }
+
+  function moveImage(clientX: number, clientY: number) {
+    if (!draggingImage) return;
+
+    const dx = clientX - dragStartRef.current.x;
+    const dy = clientY - dragStartRef.current.y;
+
+    const rawX = offsetStartRef.current.x + dx;
+    const rawY = offsetStartRef.current.y + dy;
+
+    setImgOffset(clampOffset(rawX, rawY, zoom));
+  }
+
+  function endMove() {
+    setDraggingImage(false);
+  }
+
+  function renderLevelDots(level: number) {
+    return (
+      <div style={{ display: "flex", gap: 6 }}>
+        {[1, 2, 3, 4, 5].map((n) => (
+          <div
+            key={n}
+            style={{
+              width: 12,
+              height: 12,
+              borderRadius: 999,
+              background: n <= level ? "#2962ff" : "#d9d9d9",
+            }}
+          />
+        ))}
+      </div>
+    );
+  }
+
+  const displayed = getDisplayedSize(zoom);
+
+  const bruiseActive = toolMode === "bruise";
+  const eraseActive = toolMode === "erase";
+
+  const severityLevel =
+    result?.severity === "Strong" ? 5 : result?.severity === "Moderate" ? 3 : 2;
+  const areaLevelDots =
+    result?.areaLevel === "Large" ? 5 : result?.areaLevel === "Medium" ? 3 : 2;
+  const darknessLevelDots =
+    result?.darknessLevel === "Deep" ? 5 : result?.darknessLevel === "Medium" ? 3 : 2;
 
   return (
     <main
       style={{
         padding: 24,
         fontFamily: "Arial",
-        maxWidth: 1400,
+        maxWidth: 1500,
         margin: "0 auto",
       }}
     >
-      <h1>BruiseTrace</h1>
-      <p>Inclusive skin signal measurement system</p>
+      <h1 style={{ marginBottom: 6 }}>BruiseTrace</h1>
+      <p style={{ marginTop: 0, marginBottom: 18 }}>
+        Inclusive skin signal measurement system
+      </p>
 
       <div
         style={{
           display: "grid",
-          gridTemplateColumns: "720px 360px",
+          gridTemplateColumns: "760px 540px",
           gap: 40,
+          alignItems: "start",
         }}
       >
         <section>
           <div
             style={{
               display: "flex",
-              gap: 16,
-              alignItems: "center",
-              marginBottom: 20,
+              gap: 14,
+              alignItems: "end",
               flexWrap: "wrap",
+              marginBottom: 16,
             }}
           >
             <label
               style={{
                 background: "#111",
                 color: "white",
-                padding: "12px 18px",
+                padding: "12px 20px",
                 cursor: "pointer",
-                fontWeight: 600,
+                fontWeight: 700,
+                borderRadius: 8,
               }}
             >
               Upload Photo
@@ -399,55 +435,171 @@ export default function Home() {
                   if (!file) return;
 
                   const url = URL.createObjectURL(file);
-                  setImage(url);
-                  setImgOffset({ x: 0, y: 0 });
-                  setZoom(1);
-                  setDetected(false);
-                  setAnalysisText("Center the bruise, then click Detect Bruise.");
-                  clearOverlay();
+                  const tempImg = new Image();
+
+                  tempImg.onload = () => {
+                    const natural = {
+                      width: tempImg.naturalWidth,
+                      height: tempImg.naturalHeight,
+                    };
+
+                    setImage(url);
+                    setImgNaturalSize(natural);
+
+                    const initialZoom = 1;
+                    setZoom(initialZoom);
+                    setImgOffset(centerImage(initialZoom, natural));
+                    setResult(null);
+                    setToolMode("move");
+                    setAnalysisText(
+                      "Adjust the photo if needed, then select Bruise Brush."
+                    );
+
+                    setTimeout(() => {
+                      clearMask();
+                    }, 0);
+                  };
+
+                  tempImg.src = url;
                 }}
               />
             </label>
 
-            <div>
-              <div style={{ fontSize: 14 }}>Zoom</div>
+            <div style={{ minWidth: 240 }}>
+              <div style={{ fontSize: 14, marginBottom: 6 }}>Zoom</div>
               <input
                 type="range"
                 min="1"
                 max="2.5"
                 step="0.01"
                 value={zoom}
-                onChange={(e) => setZoom(Number(e.target.value))}
-                style={{ width: 220 }}
+                onChange={(e) => {
+                  const nextZoom = Number(e.target.value);
+                  setImgOffset((prev) =>
+                    getZoomOffsetKeepingFrameCenter(zoom, nextZoom, prev)
+                  );
+                  setZoom(nextZoom);
+                }}
+                style={{ width: "100%" }}
+              />
+            </div>
+          </div>
+
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "1fr 1fr 1fr",
+              gap: 16,
+              alignItems: "start",
+              marginBottom: 18,
+              maxWidth: 724,
+            }}
+          >
+            <div>
+              <button
+                onClick={() => setToolMode("bruise")}
+                style={{
+                  width: "100%",
+                  height: 52,
+                  padding: "11px 14px",
+                  background: bruiseActive ? "#2962ff" : "#f2f2f2",
+                  color: bruiseActive ? "white" : "black",
+                  border: "1px solid #d0d0d0",
+                  fontWeight: 700,
+                  borderRadius: 8,
+                  marginBottom: 8,
+                }}
+              >
+                Bruise Brush
+              </button>
+              <input
+                type="range"
+                min="10"
+                max="70"
+                step="1"
+                value={bruiseBrushSize}
+                onChange={(e) => setBruiseBrushSize(Number(e.target.value))}
+                disabled={!bruiseActive}
+                style={{
+                  width: "100%",
+                  opacity: bruiseActive ? 1 : 0.35,
+                }}
               />
             </div>
 
+            <div>
+              <button
+                onClick={() => setToolMode("erase")}
+                style={{
+                  width: "100%",
+                  height: 52,
+                  padding: "11px 14px",
+                  background: eraseActive ? "#333" : "#f2f2f2",
+                  color: eraseActive ? "white" : "black",
+                  border: "1px solid #d0d0d0",
+                  fontWeight: 700,
+                  borderRadius: 8,
+                  marginBottom: 8,
+                }}
+              >
+                Erase
+              </button>
+              <input
+                type="range"
+                min="10"
+                max="70"
+                step="1"
+                value={eraseBrushSize}
+                onChange={(e) => setEraseBrushSize(Number(e.target.value))}
+                disabled={!eraseActive}
+                style={{
+                  width: "100%",
+                  opacity: eraseActive ? 1 : 0.35,
+                }}
+              />
+            </div>
+
+            <div>
+              <button
+                onClick={() => {
+                  clearMask();
+                  setResult(null);
+                  setToolMode("move");
+                  setAnalysisText("Selection cleared. Adjust or brush again.");
+                }}
+                style={{
+                  width: "100%",
+                  height: 52,
+                  padding: "12px 18px",
+                  background: "#f2f2f2",
+                  border: "1px solid #d0d0d0",
+                  fontWeight: 700,
+                  borderRadius: 8,
+                  marginBottom: 8,
+                }}
+              >
+                Clear Selection
+              </button>
+              <div style={{ height: 22 }} />
+            </div>
+          </div>
+
+          <div style={{ marginBottom: 18 }}>
             <button
-              onClick={detectBruise}
+              onClick={analyzeBruise}
               disabled={!image}
               style={{
-                padding: "12px 18px",
-                background: image ? "#2962ff" : "#cfcfcf",
+                padding: "13px 26px",
+                background: image ? "#0a7f3f" : "#cfcfcf",
                 color: "white",
                 border: "none",
                 cursor: image ? "pointer" : "default",
-                fontWeight: 600,
+                fontWeight: 800,
+                borderRadius: 8,
+                fontSize: 16,
               }}
             >
-              Detect Bruise
-            </button>
-
-            <button
-              onClick={resetAll}
-              style={{
-                padding: "12px 18px",
-                background: "#f2f2f2",
-                border: "1px solid #d0d0d0",
-                cursor: "pointer",
-                fontWeight: 600,
-              }}
-            >
-              Reset
+              Analyze
             </button>
           </div>
 
@@ -460,24 +612,43 @@ export default function Home() {
               position: "relative",
               background: "#f5f5f5",
               userSelect: "none",
+              borderRadius: 12,
             }}
             onMouseDown={(e) => {
               if (!image) return;
-              startDrag(e.clientX, e.clientY);
+
+              const rect = e.currentTarget.getBoundingClientRect();
+              const x = e.clientX - rect.left;
+              const y = e.clientY - rect.top;
+
+              if (toolMode === "move") {
+                startMove(e.clientX, e.clientY);
+              } else {
+                setPainting(true);
+                drawBrush(x, y);
+              }
             }}
-            onMouseMove={(e) => moveDrag(e.clientX, e.clientY)}
-            onMouseUp={endDrag}
-            onMouseLeave={endDrag}
-            onTouchStart={(e) => {
+            onMouseMove={(e) => {
               if (!image) return;
-              const touch = e.touches[0];
-              startDrag(touch.clientX, touch.clientY);
+
+              const rect = e.currentTarget.getBoundingClientRect();
+              const x = e.clientX - rect.left;
+              const y = e.clientY - rect.top;
+
+              if (toolMode === "move") {
+                moveImage(e.clientX, e.clientY);
+              } else if (painting) {
+                drawBrush(x, y);
+              }
             }}
-            onTouchMove={(e) => {
-              const touch = e.touches[0];
-              moveDrag(touch.clientX, touch.clientY);
+            onMouseUp={() => {
+              setPainting(false);
+              endMove();
             }}
-            onTouchEnd={endDrag}
+            onMouseLeave={() => {
+              setPainting(false);
+              endMove();
+            }}
           >
             {image ? (
               <>
@@ -489,12 +660,18 @@ export default function Home() {
                     position: "absolute",
                     left: imgOffset.x,
                     top: imgOffset.y,
-                    width: frameSize * zoom,
-                    height: frameSize * zoom,
-                    objectFit: "cover",
-                    cursor: draggingImage ? "grabbing" : "grab",
+                    width: displayed.width,
+                    height: displayed.height,
+                    maxWidth: "none",
+                    cursor:
+                      toolMode === "move"
+                        ? draggingImage
+                          ? "grabbing"
+                          : "grab"
+                        : "crosshair",
                   }}
                 />
+
                 <canvas
                   ref={overlayCanvasRef}
                   width={frameSize}
@@ -505,6 +682,13 @@ export default function Home() {
                     top: 0,
                     pointerEvents: "none",
                   }}
+                />
+
+                <canvas
+                  ref={maskCanvasRef}
+                  width={frameSize}
+                  height={frameSize}
+                  style={{ display: "none" }}
                 />
               </>
             ) : (
@@ -521,50 +705,15 @@ export default function Home() {
                 }}
               >
                 <div>
-                  <div style={{ fontSize: 26, fontWeight: 700 }}>
-                    Center the bruise on the +
+                  <div style={{ fontSize: 24, fontWeight: 800 }}>
+                    Upload a bruise photo
                   </div>
-                  <div style={{ marginTop: 10 }}>
-                    Upload a photo and move the image so the bruise sits in the center.
+                  <div style={{ marginTop: 10, fontSize: 16 }}>
+                    Adjust first, brush second, analyze last.
                   </div>
                 </div>
               </div>
             )}
-
-            <div
-              style={{
-                position: "absolute",
-                left: "50%",
-                top: "50%",
-                width: 30,
-                height: 30,
-                transform: "translate(-50%, -50%)",
-                pointerEvents: "none",
-              }}
-            >
-              <div
-                style={{
-                  position: "absolute",
-                  left: "50%",
-                  top: 0,
-                  width: 2,
-                  height: "100%",
-                  background: "white",
-                  transform: "translateX(-50%)",
-                }}
-              />
-              <div
-                style={{
-                  position: "absolute",
-                  top: "50%",
-                  left: 0,
-                  width: "100%",
-                  height: 2,
-                  background: "white",
-                  transform: "translateY(-50%)",
-                }}
-              />
-            </div>
 
             {image && (
               <div
@@ -575,11 +724,16 @@ export default function Home() {
                   transform: "translateX(-50%)",
                   background: "rgba(0,0,0,0.45)",
                   color: "white",
-                  padding: "6px 12px",
+                  padding: "7px 14px",
                   fontSize: 13,
+                  borderRadius: 8,
                 }}
               >
-                Drag and zoom to center the bruise
+                {toolMode === "move"
+                  ? "Move mode: drag image"
+                  : toolMode === "bruise"
+                  ? "Bruise mode: brush the bruise area"
+                  : "Erase mode: remove extra selection"}
               </div>
             )}
           </div>
@@ -596,30 +750,131 @@ export default function Home() {
           <div
             style={{
               border: "1px solid #ddd",
-              padding: 20,
+              padding: 24,
+              borderRadius: 16,
+              background: "#fff",
             }}
           >
-            <h2>ROI Preview</h2>
-            <p>{analysisText}</p>
+            <h2 style={{ marginTop: 0, marginBottom: 12 }}>Analysis</h2>
+            <p style={{ marginTop: 0, lineHeight: 1.45 }}>{analysisText}</p>
 
-            <ul>
-              <li>analysis is limited to this square</li>
-              <li>background noise is reduced</li>
-              <li>the bruise stays near the center</li>
-              <li>you can re-detect after re-centering</li>
-            </ul>
+            {!result && (
+              <ul style={{ lineHeight: 1.6, paddingLeft: 22, marginBottom: 0 }}>
+                <li>ROI area = the region you brushed</li>
+                <li>Bruise core = darker pixels inside your brushed region</li>
+                <li>Area and severity are separated on purpose</li>
+              </ul>
+            )}
 
-            <div
-              style={{
-                marginTop: 16,
-                padding: 12,
-                background: detected ? "#eef6ff" : "#f4f4f4",
-              }}
-            >
-              {detected
-                ? "Possible bruise area detected."
-                : "Next step: detect the bruise inside this square."}
-            </div>
+            {result && (
+              <>
+                <div
+                  style={{
+                    display: "inline-block",
+                    padding: "8px 12px",
+                    borderRadius: 999,
+                    background:
+                      result.severity === "Strong"
+                        ? "#ffe4e6"
+                        : result.severity === "Moderate"
+                        ? "#fff3cd"
+                        : "#e8f5e9",
+                    color:
+                      result.severity === "Strong"
+                        ? "#b42318"
+                        : result.severity === "Moderate"
+                        ? "#8a5a00"
+                        : "#166534",
+                    fontWeight: 800,
+                    marginBottom: 14,
+                  }}
+                >
+                  {result.severity} visibility
+                </div>
+
+                <div
+                  style={{
+                    padding: 18,
+                    background: "#f7f7f7",
+                    border: "1px solid #e5e5e5",
+                    borderRadius: 12,
+                    marginBottom: 14,
+                  }}
+                >
+                  <div style={{ fontWeight: 700, marginBottom: 8 }}>
+                    {result.summary}
+                  </div>
+
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "150px 1fr 90px",
+                      gap: 12,
+                      alignItems: "center",
+                      rowGap: 14,
+                      marginTop: 14,
+                    }}
+                  >
+                    <div>Overall visibility</div>
+                    {renderLevelDots(severityLevel)}
+                    <div style={{ fontWeight: 700 }}>{result.severity}</div>
+
+                    <div>Core darkness</div>
+                    {renderLevelDots(darknessLevelDots)}
+                    <div style={{ fontWeight: 700 }}>{result.darknessLevel}</div>
+
+                    <div>Selected area</div>
+                    {renderLevelDots(areaLevelDots)}
+                    <div style={{ fontWeight: 700 }}>{result.areaLevel}</div>
+                  </div>
+
+                  <div
+                    style={{
+                      marginTop: 18,
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 12,
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: 34,
+                        height: 34,
+                        borderRadius: 8,
+                        border: "1px solid #d0d0d0",
+                        background: `rgb(${result.avgR}, ${result.avgG}, ${result.avgB})`,
+                      }}
+                    />
+                    <div>
+                      <div style={{ fontWeight: 700 }}>Core bruise color</div>
+                      <div style={{ color: "#555" }}>
+                        RGB {result.avgR}, {result.avgG}, {result.avgB}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <details>
+                  <summary style={{ cursor: "pointer", fontWeight: 700 }}>
+                    Show numeric details
+                  </summary>
+                  <div
+                    style={{
+                      marginTop: 12,
+                      padding: 14,
+                      background: "#fafafa",
+                      border: "1px solid #ececec",
+                      borderRadius: 10,
+                      lineHeight: 1.7,
+                    }}
+                  >
+                    <div><b>ROI Pixels:</b> {result.roiPixels}</div>
+                    <div><b>Bruise Core Pixels:</b> {result.corePixels}</div>
+                    <div><b>Core Ratio:</b> {result.coreRatio}%</div>
+                  </div>
+                </details>
+              </>
+            )}
           </div>
         </aside>
       </div>
