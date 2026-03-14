@@ -4,9 +4,14 @@ AI-powered bruise analysis tool designed to support **inclusive skin tone assess
 
 BruiseTrace explores how image analysis and user-guided segmentation can help track bruise development more clearly across different skin tones.
 
-Live demo:
+## Prototype (v0.2)
+
+![BruiseTrace prototype](bruisetrace_v02.png)
+
+Live demo  
 https://bruisetrace.vercel.app
 
+---
 
 ## Problem
 
@@ -15,48 +20,54 @@ Many visual assessment tools are not designed with inclusive skin analysis in mi
 
 BruiseTrace experiments with a simple approach:
 
-• User-guided bruise region selection  
-• Color stage analysis  
-• Intensity scoring  
-• Consistency checking
+- User-guided bruise region selection
+- Color stage analysis
+- Intensity scoring
+- Selection consistency checking
 
+---
 
 ## Features
 
-- Guided bruise region selection  
+- Guided bruise region selection
 - Color stage estimation
 - Bruise intensity score
 - Selection consistency score
 - Canvas-based image analysis
 
+---
 
 ## Technology
 
 - Next.js
 - TypeScript
-- HTML Canvas image processing
+- Canvas image processing
 - Vercel deployment
 
+---
 
-## Project Motivation
+## Development Status
 
-This project explores how simple AI-assisted tools can support more inclusive biomedical design.
+Current version: **v0.2 prototype**
 
-Rather than replacing medical diagnosis, the goal is to help users visualize bruise changes and document healing over time.
+Planned improvements
 
+- Improved bruise stage classification
+- Better color normalization across lighting
+- More robust ROI detection
+- Visual progress tracking across multiple images
+
+---
 
 ## Future Development
 
-Planned improvements:
+- Bruise healing timeline estimation
+- Multi-image comparison
+- Medical research dataset testing
+- Expanded inclusive skin tone calibration
 
-- Time-series bruise tracking
-- Skin tone calibration
-- Improved bruise stage modeling
-- Research dataset integration
+---
 
+## Project Goal
 
-## Author
-
-Io Kim
-
-AI + Biomedical Design exploration focused on inclusive skin analytics.
+BruiseTrace is an experimental tool exploring how AI-assisted image analysis and human-guided input can support more equitable visual health assessment tools.
